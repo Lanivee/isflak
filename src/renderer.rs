@@ -1,5 +1,7 @@
 #![allow(unused)]
+use glam::*;
 use line_drawing::Bresenham;
+use multimap::MultiMap;
 use pixels::raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use pixels::{Error, Pixels, SurfaceTexture};
 use std::collections::HashMap;
@@ -56,74 +58,119 @@ impl Renderer {
         }
     }
 
-    pub fn set_pixel(&mut self, x: u32, y: u32, color: [u8; 4]) {
-        self.frame_buffer[(x + y * self.width) as usize] = color;
+    pub fn set_pixel(&mut self, position: UVec2, color: Vec4) {
+        let u8_color = [
+            (color.x * 255.0) as u8,
+            (color.y * 255.0) as u8,
+            (color.z * 255.0) as u8,
+            (color.w * 255.0) as u8,
+        ];
+
+        let x = if position.x > 0 { position.x - 1 } else { 0 };
+        let y = if position.y > 0 { position.y - 1 } else { 0 };
+
+        self.frame_buffer[(x + y * self.width) as usize] = u8_color;
     }
 
-    pub fn draw_polygon(&mut self, v0: &Vertex, v1: &Vertex, v2: &Vertex) {
-        let mut v0v1 = vec![];
-        let mut v1v2 = vec![];
-        let mut v2v0 = vec![];
+    pub fn draw_vertices(&mut self, vertices: &[Vertex]) {
+        let mut draw_pixels = vec![];
 
-        for (x, y) in Bresenham::new(v0.pos, v1.pos) {
-            v0v1.push((x, y))
+        for vertex in 0..vertices.len() {
+            let v0 = &vertices[vertex];
+            let v1 = if vertex < vertices.len() - 1 {
+                &vertices[vertex + 1]
+            } else {
+                &vertices[vertex - 2]
+            };
+
+            let v0coords = ndc_to_pixel(v0.pos, self.width, self.height).as_ivec2();
+            let v1coords = ndc_to_pixel(v1.pos, self.width, self.height).as_ivec2();
+
+            let mut temp_pixels = vec![];
+
+            for (x, y) in Bresenham::new((v0coords.x, v0coords.y), (v1coords.x, v1coords.y)) {
+                temp_pixels.push((x, y));
+            }
+
+            let mut current_pixel = 0;
+            for pos in &temp_pixels {
+                let color = lerp(v0.color, v1.color, current_pixel, temp_pixels.len() as u32);
+                current_pixel += 1;
+
+                let pixel = Pixel {
+                    pos: uvec2(pos.0 as u32, pos.1 as u32),
+                    color,
+                };
+
+                draw_pixels.push(pixel);
+            }
         }
 
-        for (x, y) in Bresenham::new(v1.pos, v2.pos) {
-            v1v2.push((x, y))
+        for _ in 0..vertices.len() / 3 {
+            let mut last_scanline = -1;
+            let mut scanlines = MultiMap::new();
+
+            for pixel in &draw_pixels {
+                let scanline = pixel.pos.y;
+                if last_scanline != scanline as i32 {
+                    scanlines.insert((scanline), (pixel.pos.x, pixel.color));
+                }
+                last_scanline = scanline as i32;
+            }
+
+            let min = scanlines.keys().min().unwrap();
+            let max = scanlines.keys().max().unwrap();
+
+            for scanline in *min..*max {
+                let mut start_end = scanlines.get_vec_mut(&scanline).unwrap();
+                if start_end.len() >= 2 {
+                    let (start_pos, end_pos) = if start_end[0].0 < start_end[1].0 {
+                        (start_end[0].0, start_end[1].0)
+                    } else {
+                        (start_end[1].0, start_end[0].0)
+                    };
+                    let line_length = end_pos - start_pos;
+                    let start_color = start_end[0].1;
+                    let end_color = start_end[1].1;
+
+                    for x in start_pos..end_pos {
+                        let color = lerp(start_color, end_color, x - start_pos, line_length);
+                        let pos = uvec2(x, scanline);
+
+                        let pixel = Pixel { pos, color };
+
+                        draw_pixels.push(pixel);
+                    }
+                }
+            }
         }
 
-        for (x, y) in Bresenham::new(v2.pos, v0.pos) {
-            v2v0.push((x, y))
+        for pixel in draw_pixels {
+            self.set_pixel(pixel.pos, pixel.color);
         }
-
-        let mut pixels = vec![];
-
-        for pixel in 0..v0v1.len() {
-            let pos = v0v1[pixel];
-            let col = lerp(v0.col, v1.col, pixel as u32, v0v1.len() as u32);
-
-            pixels.push((pos, col))
-        }
-
-        for pixel in 0..v1v2.len() {
-            let pos = v1v2[pixel];
-            let col = lerp(v1.col, v2.col, pixel as u32, v1v2.len() as u32);
-
-            pixels.push((pos, col))
-        }
-
-        for pixel in 0..v2v0.len() {
-            let pos = v2v0[pixel];
-            let col = lerp(v2.col, v0.col, pixel as u32, v2v0.len() as u32);
-
-            pixels.push((pos, col))
-        }
-
-        for pixel in pixels {
-            self.set_pixel(
-                pixel.0 .0 as u32,
-                pixel.0 .1 as u32,
-                [pixel.1 .0, pixel.1 .1, pixel.1 .2, 255],
-            );
-        }
-
-        let mut pixels2 = HashMap::new();
     }
 }
 
 pub struct Vertex {
-    pub pos: (i32, i32),
-    pub col: (u8, u8, u8),
+    pub pos: Vec2,
+    pub color: Vec4,
 }
 
-fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), current_pixel: u32, line_length: u32) -> (u8, u8, u8) {
+struct Pixel {
+    pos: UVec2,
+    color: Vec4,
+}
+
+fn ndc_to_pixel(ndc: Vec2, screen_width: u32, screen_height: u32) -> UVec2 {
+    uvec2(
+        (ndc.x * screen_width as f32) as u32,
+        (ndc.y * screen_height as f32) as u32,
+    )
+}
+
+fn lerp(a: Vec4, b: Vec4, current_pixel: u32, line_length: u32) -> Vec4 {
     let frac1 = (line_length - current_pixel) as f32 / line_length as f32;
     let frac2 = current_pixel as f32 / line_length as f32;
 
-    (
-        (a.0 as f32 * frac1 + b.0 as f32 * frac2) as u8,
-        (a.1 as f32 * frac1 + b.1 as f32 * frac2) as u8,
-        (a.2 as f32 * frac1 + b.2 as f32 * frac2) as u8,
-    )
+    a * frac1 + b * frac2
 }
